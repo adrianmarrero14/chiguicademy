@@ -1,0 +1,9 @@
+node_modules
+dist
+dist-worker
+coverage
+src/generated
+.env
+.env.*
+*.log
+.git

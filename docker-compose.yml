@@ -1,0 +1,225 @@
+# =========================================================
+#  🦫 CHIGUICADEMY - Docker Development Environment
+# =========================================================
+# Credentials for infra services come from the root .env (see .env.example).
+# The API reads its own api/.env (see api/.env.example).
+
+x-api-base: &api-base
+  build:
+    context: ./api
+    dockerfile: ../docker/api/Dockerfile
+    target: dev
+  restart: unless-stopped
+  working_dir: /app
+  volumes:
+    - ./api:/app
+    - api_node_modules:/app/node_modules
+  networks:
+    - chiguicademy_network
+
+services:
+  # ===========================================
+  # API (NestJS, HTTP process)
+  # ===========================================
+  api:
+    <<: *api-base
+    container_name: chiguicademy_api
+    # Installs dependencies into the shared node_modules volume, then watches.
+    command: sh -c "npm install && npm run start:dev"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/api/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  # ===========================================
+  # WORKER (NestJS, BullMQ processors + scheduler)
+  # ===========================================
+  worker:
+    <<: *api-base
+    container_name: chiguicademy_worker
+    # Waits for the api container (dependencies installed) before compiling.
+    command: npm run start:worker:dev
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ===========================================
+  # FRONTEND (Next.js)
+  # ===========================================
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/node/Dockerfile
+    container_name: chiguicademy_frontend
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "3000:3000"
+    networks:
+      - chiguicademy_network
+    depends_on:
+      - api
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_URL=http://localhost:8080
+      - NEXT_TELEMETRY_DISABLED=1
+      - WATCHPACK_POLLING=true
+      - CHOKIDAR_USEPOLLING=true
+
+  # ===========================================
+  # REVERSE PROXY (Nginx) -> api:3001
+  # ===========================================
+  nginx:
+    image: nginx:stable-alpine
+    container_name: chiguicademy_nginx
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/sites/:/etc/nginx/conf.d/:ro
+    networks:
+      - chiguicademy_network
+    depends_on:
+      - api
+
+  # ===========================================
+  # DATABASE (PostgreSQL)
+  # ===========================================
+  postgres:
+    image: postgres:18-alpine
+    container_name: chiguicademy_postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-chiguicademy}
+      POSTGRES_USER: ${DB_USERNAME:-chiguicademy}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-chiguicademy}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d
+    networks:
+      - chiguicademy_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-chiguicademy} -d ${DB_DATABASE:-chiguicademy}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ===========================================
+  # CACHE / QUEUES (Redis)
+  # ===========================================
+  redis:
+    image: redis:7-alpine
+    container_name: chiguicademy_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - chiguicademy_network
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ===========================================
+  # S3-COMPATIBLE STORAGE (MinIO)
+  # ===========================================
+  minio:
+    image: minio/minio:latest
+    container_name: chiguicademy_minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-chiguicademy}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-chiguicademy123}
+    volumes:
+      - minio_data:/data
+    networks:
+      - chiguicademy_network
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Creates the default bucket once MinIO is ready, then exits.
+  minio-init:
+    image: minio/mc:latest
+    container_name: chiguicademy_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY:-chiguicademy} ${MINIO_SECRET_KEY:-chiguicademy123}
+      && mc mb --ignore-existing local/${S3_BUCKET:-chiguicademy}"
+    networks:
+      - chiguicademy_network
+
+  # ===========================================
+  # LOCAL MAIL (Mailpit)
+  # ===========================================
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: chiguicademy_mailpit
+    restart: unless-stopped
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+    networks:
+      - chiguicademy_network
+
+  # ===========================================
+  # DATABASE ADMIN (pgAdmin) - tools profile
+  # ===========================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: chiguicademy_pgadmin
+    restart: unless-stopped
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@chiguicademy.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - chiguicademy_network
+    profiles:
+      - tools
+
+networks:
+  chiguicademy_network:
+    driver: bridge
+    name: chiguicademy_network
+
+volumes:
+  postgres_data:
+    name: chiguicademy_postgres_data
+  redis_data:
+    name: chiguicademy_redis_data
+  minio_data:
+    name: chiguicademy_minio_data
+  pgadmin_data:
+    name: chiguicademy_pgadmin_data
+  api_node_modules:
+    name: chiguicademy_api_node_modules

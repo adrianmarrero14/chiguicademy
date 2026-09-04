@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Environment (templates *.example are kept)
+.env
+.env.local
+.env.*.local
+api/.env
+frontend/.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build
+.next/
+dist/
+dist-worker/
+build/
+out/
+*.tsbuildinfo
+
+# Generated code
+api/src/generated/
+
+# Testing
+coverage/
